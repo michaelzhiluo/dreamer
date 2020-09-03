@@ -70,9 +70,11 @@ def define_config():
   config.actor_lr = 8e-5
   config.grad_clip = 100.0
   config.dataset_balance = False
-  config.max_imagine_depth = 4
+  config.max_imagine_depth = 1
   config.imagine_decay = 0.5
   config.branch_type = "uniform"#"reward"
+  config.horizon_schedule=[16, 16, 20000]
+  config.depth_schedule=[3, 3, 20000]
   # Behavior.
   config.discount = 0.99
   config.disclam = 0.95
@@ -99,6 +101,8 @@ class Dreamer(tools.Module):
     self._should_pretrain = tools.Once()
     self._should_train = tools.Every(config.train_every)
     self._should_log = tools.Every(config.log_every)
+    self.horizon_schedule = config.horizon_schedule
+    self.depth_schedule = config.depth_schedule
     self._last_log = None
     self._last_time = time.time()
     self._metrics = collections.defaultdict(tf.metrics.Mean)
@@ -121,16 +125,32 @@ class Dreamer(tools.Module):
       n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
       print(f'Training for {n} steps.')
       with self._strategy.scope():
+        horizon = self.hor_schedule(step)
+        depth = self.dep_schedule(step)
         for train_step in range(n):
           log_images = self._c.log_images and log and train_step == 0
-          print(train_step)
-          self.train(next(self._dataset), log_images)
+          print(train_step, step, depth, horizon)
+          self.train(next(self._dataset), log_images, init_horizon=horizon, imagine_depth=depth)
       if log:
         self._write_summaries()
     action, state = self.policy(obs, state, training)
     if training:
       self._step.assign_add(len(reset) * self._c.action_repeat)
     return action, state
+
+  def hor_schedule(self, step):
+    min_horizon = self.horizon_schedule[0]
+    max_horizon = self.horizon_schedule[1]
+    interval = self.horizon_schedule[2]
+    x = min(min_horizon + int(step/interval), max_horizon)
+    return x
+
+  def dep_schedule(self, step):
+    min_depth = self.depth_schedule[0]
+    max_depth = self.depth_schedule[1]
+    interval = self.depth_schedule[2]
+    x = min(min_depth + int(step/interval), max_depth)
+    return x
 
   @tf.function
   def policy(self, obs, state, training):
@@ -155,10 +175,10 @@ class Dreamer(tools.Module):
     self._should_pretrain()
 
   @tf.function()
-  def train(self, data, log_images=False):
-    self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+  def train(self, data, log_images=False, init_horizon=15, imagine_depth=1):
+    self._strategy.experimental_run_v2(self._train, args=(data, log_images, init_horizon, imagine_depth))
 
-  def _train(self, data, log_images):
+  def _train(self, data, log_images, init_horizon, imagine_depth):
     with tf.GradientTape() as model_tape:
       embed = self._encode(data)
       post, prior = self._dynamics.observe(embed, data['action'])
@@ -187,15 +207,15 @@ class Dreamer(tools.Module):
       returns_lst = []
       discounts = []
       actor_loss = 0.0
-      imagine_depth = self._c.horizon
-      for depth in range(self._c.max_imagine_depth):
+      horizon = init_horizon
+      for depth in range(imagine_depth):
         if self._c.pcont:  # Last step could be terminal.
           post = {k: v[:, :-1] for k, v in post.items()}
         post = {k: flatten(v) for k, v in post.items()}
         if depth != 0:
           post = {k: tf.stop_gradient(tf.gather(v, indices=max_indexes, axis=0)) for k,v in post.items()}
-        imag_feat, post = self._imagine_ahead(post, imagine_depth)
-
+        imag_feat, post = self._imagine_ahead(post, horizon)
+        tf.print("Imagination Features:", tf.shape(imag_feat))
         reward = self._reward(imag_feat).mode()
         if self._c.pcont:
           pcont = self._pcont(imag_feat).mean()
@@ -209,7 +229,7 @@ class Dreamer(tools.Module):
         discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
             [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
         
-        if depth!=self._c.max_imagine_depth-1:
+        if depth!=imagine_depth-1:
           if self._c.branch_type == "reward":
             flat_reward = flatten(reward)
             max_indexes = tf.math.top_k(flat_reward, k=int(2500/self._strategy.num_replicas_in_sync), sorted=False)[1]
@@ -220,14 +240,14 @@ class Dreamer(tools.Module):
             flat_value = flatten(value)
             max_indexes = tf.math.top_k(flat_value, k=int(2500/self._strategy.num_replicas_in_sync), sorted=False)[1]
 
-        imagine_depth = int(imagine_depth*self._c.imagine_decay)
+        horizon = int(horizon*self._c.imagine_decay)
 
         imag_feats.append(imag_feat)
         returns_lst.append(returns)
         discounts.append(discount)
         actor_loss += -tf.reduce_mean(discount * returns)
       
-      actor_loss /= float(self._strategy.num_replicas_in_sync*self._c.max_imagine_depth)
+      actor_loss /= float(self._strategy.num_replicas_in_sync*imagine_depth)
 
     with tf.GradientTape() as value_tape:
       value_loss = 0.0
@@ -235,7 +255,7 @@ class Dreamer(tools.Module):
         value_pred = self._value(imag_feat)[:-1]
         target = tf.stop_gradient(returns)
         value_loss += -tf.reduce_mean(discount * value_pred.log_prob(target))
-      value_loss /= float(self._strategy.num_replicas_in_sync*self._c.max_imagine_depth)
+      value_loss /= float(self._strategy.num_replicas_in_sync*imagine_depth)
 
     model_norm = self._model_opt(model_tape, model_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
