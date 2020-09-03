@@ -70,10 +70,13 @@ def define_config():
   config.actor_lr = 8e-5
   config.grad_clip = 100.0
   config.dataset_balance = False
+  config.max_imagine_depth = 4
+  config.imagine_decay = 0.5
+  config.branch_type = "uniform"#"reward"
   # Behavior.
   config.discount = 0.99
   config.disclam = 0.95
-  config.horizon = 15
+  config.horizon = 16
   config.action_dist = 'tanh_normal'
   config.action_init_std = 5.0
   config.expl = 'additive_gaussian'
@@ -120,6 +123,7 @@ class Dreamer(tools.Module):
       with self._strategy.scope():
         for train_step in range(n):
           log_images = self._c.log_images and log and train_step == 0
+          print(train_step)
           self.train(next(self._dataset), log_images)
       if log:
         self._write_summaries()
@@ -177,26 +181,61 @@ class Dreamer(tools.Module):
       model_loss /= float(self._strategy.num_replicas_in_sync)
 
     with tf.GradientTape() as actor_tape:
-      imag_feat = self._imagine_ahead(post)
-      reward = self._reward(imag_feat).mode()
-      if self._c.pcont:
-        pcont = self._pcont(imag_feat).mean()
-      else:
-        pcont = self._c.discount * tf.ones_like(reward)
-      value = self._value(imag_feat).mode()
-      returns = tools.lambda_return(
-          reward[:-1], value[:-1], pcont[:-1],
-          bootstrap=value[-1], lambda_=self._c.disclam, axis=0)
-      discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
-          [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
-      actor_loss = -tf.reduce_mean(discount * returns)
-      actor_loss /= float(self._strategy.num_replicas_in_sync)
+      flatten = lambda x: tf.reshape(x, [-1] + list(x.shape[2:]))
+      discount = None
+      imag_feats = []
+      returns_lst = []
+      discounts = []
+      actor_loss = 0.0
+      imagine_depth = self._c.horizon
+      for depth in range(self._c.max_imagine_depth):
+        if self._c.pcont:  # Last step could be terminal.
+          post = {k: v[:, :-1] for k, v in post.items()}
+        post = {k: flatten(v) for k, v in post.items()}
+        if depth != 0:
+          post = {k: tf.stop_gradient(tf.gather(v, indices=max_indexes, axis=0)) for k,v in post.items()}
+        imag_feat, post = self._imagine_ahead(post, imagine_depth)
+
+        reward = self._reward(imag_feat).mode()
+        if self._c.pcont:
+          pcont = self._pcont(imag_feat).mean()
+        else:
+          pcont = self._c.discount * tf.ones_like(reward)
+        value = self._value(imag_feat).mode()
+        returns = tools.lambda_return(
+            reward[:-1], value[:-1], pcont[:-1],
+            bootstrap=value[-1], lambda_=self._c.disclam, axis=0)
+        
+        discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
+            [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
+        
+        if depth!=self._c.max_imagine_depth-1:
+          if self._c.branch_type == "reward":
+            flat_reward = flatten(reward)
+            max_indexes = tf.math.top_k(flat_reward, k=int(2500/self._strategy.num_replicas_in_sync), sorted=False)[1]
+          elif self._c.branch_type == "uniform":
+            flat_reward = flatten(reward)
+            max_indexes = tf.random.uniform([int(2500/self._strategy.num_replicas_in_sync)], minval=0, maxval=flat_reward.shape[0], dtype=tf.int32)
+          elif self._c.branch_type == "value":
+            flat_value = flatten(value)
+            max_indexes = tf.math.top_k(flat_value, k=int(2500/self._strategy.num_replicas_in_sync), sorted=False)[1]
+
+        imagine_depth = int(imagine_depth*self._c.imagine_decay)
+
+        imag_feats.append(imag_feat)
+        returns_lst.append(returns)
+        discounts.append(discount)
+        actor_loss += -tf.reduce_mean(discount * returns)
+      
+      actor_loss /= float(self._strategy.num_replicas_in_sync*self._c.max_imagine_depth)
 
     with tf.GradientTape() as value_tape:
-      value_pred = self._value(imag_feat)[:-1]
-      target = tf.stop_gradient(returns)
-      value_loss = -tf.reduce_mean(discount * value_pred.log_prob(target))
-      value_loss /= float(self._strategy.num_replicas_in_sync)
+      value_loss = 0.0
+      for imag_feat, returns, discount in zip(imag_feats, returns_lst, discounts):
+        value_pred = self._value(imag_feat)[:-1]
+        target = tf.stop_gradient(returns)
+        value_loss += -tf.reduce_mean(discount * value_pred.log_prob(target))
+      value_loss /= float(self._strategy.num_replicas_in_sync*self._c.max_imagine_depth)
 
     model_norm = self._model_opt(model_tape, model_loss)
     actor_norm = self._actor_opt(actor_tape, actor_loss)
@@ -267,18 +306,17 @@ class Dreamer(tools.Module):
           action)
     raise NotImplementedError(self._c.expl)
 
-  def _imagine_ahead(self, post):
-    if self._c.pcont:  # Last step could be terminal.
-      post = {k: v[:, :-1] for k, v in post.items()}
-    flatten = lambda x: tf.reshape(x, [-1] + list(x.shape[2:]))
-    start = {k: flatten(v) for k, v in post.items()}
-    policy = lambda state: self._actor(
-        tf.stop_gradient(self._dynamics.get_feat(state))).sample()
+  def _imagine_ahead(self, start, imag_depth):
+    def rollout_traj(prev_state, _):
+      cur_feat = tf.stop_gradient(self._dynamics.get_feat(prev_state))
+      action = self._actor(cur_feat).sample()
+      return self._dynamics.img_step(prev_state, action)
+
     states = tools.static_scan(
-        lambda prev, _: self._dynamics.img_step(prev, policy(prev)),
-        tf.range(self._c.horizon), start)
+        rollout_traj,
+        tf.range(imag_depth), start)
     imag_feat = self._dynamics.get_feat(states)
-    return imag_feat
+    return imag_feat, states
 
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
